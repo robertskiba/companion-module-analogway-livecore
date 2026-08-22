@@ -40,13 +40,13 @@ export const getFeedbacks = (self) => {
 		],
 		callback: (feedback) => {
 			if (
-				(feedback.options.preset === pgm || feedback.options.preset === any) &&
+				(feedback.options.preset === 'pgm' || feedback.options.preset === 'any') &&
 				self.tallyPGM[feedback.options.source]
 			) {
 				return true
 			}
 			if (
-				(feedback.options.preset === pvw || feedback.options.preset === any) &&
+				(feedback.options.preset === 'pvw' || feedback.options.preset === 'any') &&
 				self.tallyPVW[feedback.options.source]
 			) {
 				return true
@@ -70,7 +70,7 @@ export const getFeedbacks = (self) => {
 				id: 'memory',
 				default: 1,
 				min: 1,
-				max: 119,
+				max: 144,
 			},
 			{
 				type: 'dropdown',

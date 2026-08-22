@@ -1,7 +1,22 @@
-import { InstanceBase, InstanceStatus, runEntrypoint, Regex, TCPHelper } from '@companion-module/base'
+import { InstanceBase, InstanceStatus, Regex, TCPHelper } from '@companion-module/base'
 import { getFeedbacks } from './feedbacks.js'
 
-class LiveCore extends InstanceBase {
+export const UpgradeScripts = []
+
+//Short names for the 6 input plug types, indexed to match INplg's values and the "Plug" dropdown.
+const PLUG_NAMES = ['VGA', 'DVI-A', 'DVI', 'SDI', 'HDMI', 'DisplayPort']
+
+//Decodes VEupd's firmware version into a readable string, e.g. 67239971 -> "4.02.23"
+//Each field is BCD-encoded (its hex digits are the decimal digits), not a plain binary number.
+function decodeFirmwareVersion(raw) {
+	const isBeta = (raw >>> 31) & 1
+	const major = parseInt(((raw >>> 24) & 0x7f).toString(16), 10)
+	const minor = ((raw >>> 16) & 0xff).toString(16).padStart(2, '0')
+	const build = (raw & 0xffff).toString(16)
+	return `${major}.${minor}.${build}` + (isBeta ? ' BETA' : '')
+}
+
+export default class LiveCore extends InstanceBase {
 	constructor(internal) {
 		super(internal)
 	}
@@ -15,12 +30,81 @@ class LiveCore extends InstanceBase {
 		this.numInputs = 0
 		this.modelnum
 		this.modelname = ''
+		this.isSimulator = false
 		this.tallyPGM = Array.from({ length: 49 }, () => 0)
 		this.tallyPVW = Array.from({ length: 49 }, () => 0)
 		this.activeScreen = Array.from({ length: 8 }, () => 0)
+		// Raw per-buffer memory identity, as reported by PIpid. Buffer 0/1 do not
+		// correspond to PGM/PVW directly - which buffer is live in program depends
+		// on the take/t-bar status (SPCtb), so PGM/PVW have to be derived, see updatePresetMemories().
+		this.memoriesBuf0 = Array.from({ length: 8 }, () => 255)
+		this.memoriesBuf1 = Array.from({ length: 8 }, () => 255)
+		this.programBuffer = Array.from({ length: 8 }, () => 0)
 		this.memoriesPGM = Array.from({ length: 8 }, () => 255)
 		this.memoriesPVW = Array.from({ length: 8 }, () => 255)
+		this.screenNameChars = Array.from({ length: 8 }, () => [])
+		this.screenNames = Array.from({ length: 8 }, () => '')
+		// LiveCore supports up to 8 screens (across up to 2 stacked devices), but not all of them
+		// necessarily exist - SPise tells us which ones are actually enabled, see updateVariableDefinitions().
+		this.screenEnabled = Array.from({ length: 8 }, () => false)
+		// Sticky version of screenEnabled: set once a screen is first seen enabled, never reset -
+		// used to keep that screen's variables declared even if it later goes into confidence mode
+		// (which makes SPise report it as disabled), see updateVariableDefinitions().
+		this.screenKnownToExist = Array.from({ length: 8 }, () => false)
 
+		// Master preset memories (up to 144) - unlike regular preset memories, the protocol exposes
+		// a validity flag (PSval) for these, so the "Load Master Memory" dropdown can be limited to
+		// slots that actually have something saved, labelled with their name (LBPSe).
+		this.masterMemoryValid = Array.from({ length: 144 }, () => false)
+		this.masterMemoryNameChars = Array.from({ length: 144 }, () => [])
+		this.masterMemoryNames = Array.from({ length: 144 }, () => '')
+
+		// Regular preset memories (up to 144) have no validity flag, so unlike master memories
+		// the "Load Memory" dropdown can't be limited to slots that are actually saved - all 144
+		// are listed, labelled with their name (LBPMe) if known.
+		this.presetMemoryNameChars = Array.from({ length: 144 }, () => [])
+		this.presetMemoryNames = Array.from({ length: 144 }, () => '')
+
+		// Confidence memories (up to 16) and monitoring memories (up to 8) also have no validity
+		// flag, so all slots are listed, labelled with their name if known.
+		this.confidenceMemoryNameChars = Array.from({ length: 16 }, () => [])
+		this.confidenceMemoryNames = Array.from({ length: 16 }, () => '')
+		this.monitoringMemoryNameChars = Array.from({ length: 8 }, () => [])
+		this.monitoringMemoryNames = Array.from({ length: 8 }, () => '')
+
+		// Device-wide diagnostic values, exposed as device.* variables.
+		this.deviceFirmware = ''
+		this.deviceControllers = 0
+		this.deviceFanAlarm = 0
+		this.deviceTemperatureAlarm = false
+		this.deviceReady = false
+
+		// Up to 24 inputs (12 on the master device, another 12 on a linked slave device) - INava
+		// tells us which actually exist, so the "Input" dropdowns only list real inputs.
+		this.inputAvailable = Array.from({ length: 24 }, () => false)
+		// An input's name (LBInp) depends on which of its 6 plugs is currently active (INplg) -
+		// only the active plug has a meaningful name, others are blank or a generic placeholder.
+		this.inputActivePlug = Array.from({ length: 24 }, () => 0)
+		this.inputNameChars = Array.from({ length: 24 }, () => [])
+		this.inputNames = Array.from({ length: 24 }, () => '')
+		// Which of the 6 plug types are actually available on each input (INpav), used for the
+		// "Available Input Plugs" info text on the "Switch input plug" action.
+		this.inputPlugAvailable = Array.from({ length: 24 }, () => Array.from({ length: 6 }, () => false))
+
+		// Screen resolution and confidence-mode status, exposed as S{n}.width/height/isconfidence.
+		this.screenWidth = Array.from({ length: 8 }, () => 0)
+		this.screenHeight = Array.from({ length: 8 }, () => 0)
+		this.screenIsConfidence = Array.from({ length: 8 }, () => false)
+
+		// A screen can span up to 4 physical outputs (a "canvas") - a separate dimension from
+		// screens. OUava tells us which of the up to 8 outputs actually exist.
+		this.outputAvailable = Array.from({ length: 8 }, () => false)
+		this.outputActive = Array.from({ length: 8 }, () => false)
+		this.outputHdcp = Array.from({ length: 8 }, () => false)
+		this.outputNameChars = Array.from({ length: 8 }, () => [])
+		this.outputNames = Array.from({ length: 8 }, () => '')
+
+		this.updateVariableDefinitions()
 		this.updateStatus(InstanceStatus.Connecting)
 
 		/**
@@ -75,11 +159,10 @@ class LiveCore extends InstanceBase {
 
 	configUpdated(config) {
 		let oldhost = this.config.host
-		let oldport = this.config.port
 		if (config.host == '') config.host = '192.168.2.140'
 		this.config = config
-		if (oldhost !== config.host || oldport !== config.port) {
-			self.init_tcp()
+		if (oldhost !== config.host) {
+			this.init_tcp()
 		}
 	}
 
@@ -87,15 +170,20 @@ class LiveCore extends InstanceBase {
 		let self = this
 		this.log('debug', 'Received line from Livecore: ' + line)
 
-		if (line.match(/TPcon\d,\d+/)) {
-			if (line.match(/TPcon0,\d+/) == null) {
+		if (line.match(/(TPcon|ITcct)\d,\d+/)) {
+			// TPcon is the greeting on the documented TPP port (usually 10600), ITcct is the
+			// equivalent greeting on the richer, undocumented internal port (usually 10500) -
+			// same argument format (device index, connected controller count) either way.
+			const greeting = line.match(/TPcon/) ? 'TPcon' : 'ITcct'
+			if (line.match(new RegExp(greeting + '0,\\d+')) == null) {
 				self.log(
 					'error',
 					'Connected to ' + self.label + ', but this is not the master of stacked configuation! Closing connection now.'
 				)
 				self.socket.destroy()
 			}
-			let connectedDevices = parseInt(line.match(/TPcon0,(\d)/)[1])
+			let connectedDevices = parseInt(line.match(new RegExp(greeting + '0,(\\d)'))[1])
+			self.setVariableValues({ 'device.controllers': connectedDevices })
 			if (connectedDevices < 4) {
 				self.log('info', self.label + ' has ' + (connectedDevices - 1) + ' other connected controller(s).')
 				self.sendcmd('?')
@@ -178,18 +266,166 @@ class LiveCore extends InstanceBase {
 			}
 			self.log('info', self.label + ' Type is ' + this.modelname)
 			self.sendcmd('0,TPver')
+			self.sendcmd('SIdev')
+		} else if (line.match(/SIdev\d+$/)) {
+			//Whether this connection is talking to a real device or the AW_SIMULATOR
+			this.isSimulator = line.replace('SIdev', '') === '1'
+		} else if (line.match(/VEupd\d+,\d+$/)) {
+			//Device firmware version (bit-packed, see decodeFirmwareVersion). Needs the device index prefix.
+			const raw = Number(line.replace('VEupd', '').split(',')[1])
+			this.deviceFirmware = decodeFirmwareVersion(raw)
+			this.setVariableValues({ 'device.firmware': this.deviceFirmware })
+		} else if (line.match(/PCdgs\d+$/)) {
+			//Device global state - 255 = ready, anything else is some other/unknown state. No device index prefix.
+			this.deviceReady = line.replace('PCdgs', '') === '255'
+			this.setVariableValues({ 'device.ready': this.deviceReady })
+		} else if (line.match(/TEdal\d+,\d+$/)) {
+			//Temperature alarm status of the device (0 = none, otherwise some alarm level is active, see ENUM_TEMP_ALARM_LVL). Needs the device index prefix.
+			const value = line.replace('TEdal', '').split(',')[1]
+			this.deviceTemperatureAlarm = value !== '0'
+			this.setVariableValues({ 'device.temperature_alarm': this.deviceTemperatureAlarm })
+		} else if (line.match(/FAalm\d+,(0|1)$/)) {
+			//Fan alarm status of the device (1 = a fan alarm is raised). Needs the device index prefix.
+			this.deviceFanAlarm = line.replace('FAalm', '').split(',')[1] === '1'
+			this.setVariableValues({ 'device.fan_alarm': this.deviceFanAlarm })
+		} else if (line.match(/INava\d+,(0|1)$/)) {
+			//Whether an input actually exists (12 without a linked slave device, 24 with)
+			const [input, available] = line.replace('INava', '').split(',')
+			const wasAvailable = this.inputAvailable[Number(input)]
+			this.inputAvailable[Number(input)] = available === '1'
+			if (this.inputAvailable[Number(input)] !== wasAvailable) {
+				this.actions() // rebuild action definitions, e.g. the input dropdowns
+				if (this.inputAvailable[Number(input)]) {
+					//Only query further detail once we know the input actually exists
+					this.sendcmd(input + ',INplg')
+					for (let p = 0; p < 6; p += 1) {
+						this.sendcmd(input + ',' + p + ',INpav')
+					}
+				}
+			}
+		} else if (line.match(/INpav\d+,\d+,(0|1)$/)) {
+			//Whether a given plug is available on an input, used for the "Available Input Plugs" info text
+			const [input, plug, available] = line.replace('INpav', '').split(',')
+			this.inputPlugAvailable[Number(input)][Number(plug)] = available === '1'
+			this.actions() // rebuild action definitions, e.g. the plug availability info text
+		} else if (line.match(/INplg\d+,\d+$/)) {
+			//Which of the 6 plugs is currently active on an input - the name (LBInp) depends on this
+			const [input, plug] = line.replace('INplg', '').split(',')
+			this.inputActivePlug[Number(input)] = Number(plug)
+			this.actions() // rebuild action definitions, e.g. the input dropdown label's plug name
+			for (let c = 0; c < 16; c += 1) {
+				this.sendcmd(input + ',' + plug + ',' + c + ',LBInp')
+			}
+		} else if (line.match(/LBInp\d+,\d+,\d+,\d+$/)) {
+			//One character (as ASCII code) of an input's name, 16 chars max, NUL-terminated if shorter.
+			//Only meaningful for the currently active plug (see INplg above) - ignore stale queries for
+			//a plug that is no longer active.
+			const [input, plug, charIndex, code] = line.replace('LBInp', '').split(',').map(Number)
+			if (plug !== this.inputActivePlug[input]) return
+			this.inputNameChars[input][charIndex] = code
+			let name = ''
+			for (const c of this.inputNameChars[input]) {
+				if (c === undefined || c === 0) break
+				name += String.fromCharCode(c)
+			}
+			if (this.inputNames[input] !== name) {
+				this.inputNames[input] = name
+				this.actions() // rebuild action definitions, e.g. the input dropdown labels
+			}
+		} else if (line.match(/OUava\d+,(0|1)$/)) {
+			//Whether an output actually exists. A screen/canvas can span up to 4 outputs - a separate
+			//dimension from screens, up to 8 outputs total across up to 2 stacked devices.
+			const [output, available] = line.replace('OUava', '').split(',')
+			const wasAvailable = this.outputAvailable[Number(output)]
+			this.outputAvailable[Number(output)] = available === '1'
+			if (this.outputAvailable[Number(output)] !== wasAvailable) {
+				this.updateVariableDefinitions()
+				if (this.outputAvailable[Number(output)]) {
+					//Only query further detail once we know the output actually exists
+					this.sendcmd(output + ',OUena')
+					this.sendcmd(output + ',OUihc')
+					for (let c = 0; c < 16; c += 1) {
+						this.sendcmd(output + ',' + c + ',LBOut')
+					}
+				}
+			}
+		} else if (line.match(/OUena\d+,(0|1)$/)) {
+			//Whether an output is currently active
+			const [output, active] = line.replace('OUena', '').split(',')
+			this.outputActive[Number(output)] = active === '1'
+			this.setVariableValues({ [`Out${Number(output) + 1}.active`]: this.outputActive[Number(output)] })
+		} else if (line.match(/OUihc\d+,(0|1)$/)) {
+			//HDCP status for an output (1 = signal is HDCP-encrypted)
+			const [output, hdcp] = line.replace('OUihc', '').split(',')
+			this.outputHdcp[Number(output)] = hdcp === '1'
+			this.setVariableValues({ [`Out${Number(output) + 1}.hdcp`]: this.outputHdcp[Number(output)] })
+		} else if (line.match(/LBOut\d+,\d+,\d+$/)) {
+			//One character (as ASCII code) of an output's name, 16 chars max, NUL-terminated if shorter
+			const [output, charIndex, code] = line.replace('LBOut', '').split(',').map(Number)
+			this.outputNameChars[output][charIndex] = code
+			let name = ''
+			for (const c of this.outputNameChars[output]) {
+				if (c === undefined || c === 0) break
+				name += String.fromCharCode(c)
+			}
+			if (this.outputNames[output] !== name) {
+				this.outputNames[output] = name
+				this.setVariableValues({ [`Out${output + 1}.name`]: name })
+			}
 		} else if (line.match(/TPver\d+/)) {
 			let commandSetVersion = parseInt(line.match(/TPver\d+,(\d+)/)[1])
 			self.log('info', 'Command set version of ' + self.label + ' is ' + commandSetVersion)
+			// Device-wide diagnostic values for the device.* variables
+			self.sendcmd('0,VEupd')
+			self.sendcmd('PCdgs')
+			self.sendcmd('0,TEdal')
+			self.sendcmd('0,FAalm')
+			// Query which of the up to 24 inputs actually exist (12 without a linked slave device, 24 with)
+			for (let i = 0; i < 24; i += 1) {
+				self.sendcmd(i + ',INava')
+			}
+			// Query which of the up to 8 outputs actually exist (a screen/canvas can span up to 4 -
+			// this is a separate dimension from screens). Further detail is only queried once known to exist.
+			for (let o = 0; o < 8; o += 1) {
+				self.sendcmd(o + ',OUava')
+			}
 			// Actually here we would need to check if a parameter readback is ongoing, but TPdie does always give value 1, so just read status of tallies
 			for (let i = 1; i < 42; i += 1) {
 				self.sendcmd(i + ',TAopr')
 				self.sendcmd(i + ',TAopw')
 			}
+			// Query which of the 8 possible screens actually exist first. The rest of the
+			// per-screen state (and the expensive 16-character name readback) is only queried
+			// for screens that come back enabled, see the SPise handling below.
+			self.log('info', 'Querying SPise for 8 screens')
 			for (let i = 0; i < 8; i += 1) {
-				self.sendcmd(i + ',SPscl')
-				self.sendcmd(i + ',0,PIpid')
-				self.sendcmd(i + ',1,PIpid')
+				self.sendcmd(i + ',SPise')
+			}
+			self.log('info', 'Done querying SPise')
+			// Query which master preset memory slots are actually valid/saved. Names are only
+			// queried for slots that come back valid, see the PSval handling below.
+			for (let m = 0; m < 144; m += 1) {
+				self.sendcmd(m + ',PSval')
+			}
+			// Regular preset memories have no validity flag, so query all 144 names upfront.
+			self.log('info', 'Querying LBPMe names for 144 preset memories')
+			for (let m = 0; m < 144; m += 1) {
+				for (let c = 0; c < 16; c += 1) {
+					self.sendcmd(m + ',' + c + ',LBPMe')
+				}
+			}
+			self.log('info', 'Done querying LBPMe')
+			// Confidence memories (up to 16) and monitoring memories (up to 8) also have no
+			// validity flag, so query all their names upfront too.
+			for (let m = 0; m < 16; m += 1) {
+				for (let c = 0; c < 16; c += 1) {
+					self.sendcmd(m + ',' + c + ',CMlab')
+				}
+			}
+			for (let m = 0; m < 8; m += 1) {
+				for (let c = 0; c < 16; c += 1) {
+					self.sendcmd(m + ',' + c + ',LBMMo')
+				}
 			}
 		} else if (line.match(/TPdie0/)) {
 			//There is no parameter readback runnning, it can be started now
@@ -225,18 +461,236 @@ class LiveCore extends InstanceBase {
 			//Information about selected screens for global take
 			const [screen, selected] = line.replace('SPscl', '').split(',')
 			this.activeScreen[Number(screen)] = Number(selected)
+			this.setVariableValues({ [`S${Number(screen) + 1}.globaltake`]: Number(selected) === 1 })
 			this.checkFeedbacks('screen_active')
 		} else if (line.match(/PIpid\d+,0,\d+$/)) {
-			//Information about screen memory loaded in program
-			const [screen, _preset, memory] = line.replace('PIpid', '').split(',')
-			this.memoriesPGM[Number(screen)] = Number(memory)
-			this.checkFeedbacks('memory_active')
+			//Information about the memory loaded into preset buffer 0 of a screen
+			const [screen, _buffer, memory] = line.replace('PIpid', '').split(',')
+			this.memoriesBuf0[Number(screen)] = Number(memory)
+			this.updatePresetMemories()
 		} else if (line.match(/PIpid\d+,1,\d+$/)) {
-			//Information about screen memory loaded in preview
-			const [screen, _preset, memory] = line.replace('PIpid', '').split(',')
-			this.memoriesPVW[Number(screen)] = Number(memory)
-			this.checkFeedbacks('memory_active')
+			//Information about the memory loaded into preset buffer 1 of a screen
+			const [screen, _buffer, memory] = line.replace('PIpid', '').split(',')
+			this.memoriesBuf1[Number(screen)] = Number(memory)
+			this.updatePresetMemories()
+		} else if (line.match(/(SPCtb|GCtba)\d+,\d+$/)) {
+			//Take/t-bar status: which preset buffer (0 or 1) is currently live in program for a screen.
+			//SPCtb is the settled position after a discrete take (0 or 65535); GCtba is the live
+			//analog position while a t-bar is being dragged (e.g. from the operator UI), same value
+			//range. A take swaps program/preview without re-announcing PIpid, so this has to be tracked
+			//separately.
+			const command = line.match(/SPCtb/) ? 'SPCtb' : 'GCtba'
+			const [screen, value] = line.replace(command, '').split(',')
+			this.programBuffer[Number(screen)] = Number(value) < 32768 ? 0 : 1
+			this.setVariableValues({ [`S${Number(screen) + 1}.t-bar`]: Number(value) < 32768 ? 'down' : 'up' })
+			this.updatePresetMemories()
+		} else if (line.match(/SCssh\d+,\d+$/)) {
+			//Screen width status (pixels). Note this doesn't account for an active AOI, which can
+			//reduce the effective visible area without changing this value.
+			const [screen, width] = line.replace('SCssh', '').split(',')
+			this.screenWidth[Number(screen)] = Number(width)
+			this.setVariableValues({ [`S${Number(screen) + 1}.width`]: Number(width) })
+		} else if (line.match(/SCssv\d+,\d+$/)) {
+			//Screen height status (lines)
+			const [screen, height] = line.replace('SCssv', '').split(',')
+			this.screenHeight[Number(screen)] = Number(height)
+			this.setVariableValues({ [`S${Number(screen) + 1}.height`]: Number(height) })
+		} else if (line.match(/SCico\d+,(0|1)$/)) {
+			//Confidence mode status for a screen (1 = screen is confidential)
+			const [screen, active] = line.replace('SCico', '').split(',')
+			this.screenIsConfidence[Number(screen)] = active === '1'
+			this.setVariableValues({ [`S${Number(screen) + 1}.isconfidence`]: this.screenIsConfidence[Number(screen)] })
+		} else if (line.match(/LBScr\d+,\d+,\d+$/)) {
+			//One character (as ASCII code) of a screen's name, 16 chars max, NUL-terminated if shorter
+			const [screen, charIndex, code] = line.replace('LBScr', '').split(',').map(Number)
+			this.screenNameChars[screen][charIndex] = code
+			let name = ''
+			for (const c of this.screenNameChars[screen]) {
+				if (c === undefined || c === 0) break
+				name += String.fromCharCode(c)
+			}
+			if (this.screenNames[screen] !== name) {
+				this.screenNames[screen] = name
+				this.setVariableValues({ [`S${screen + 1}.name`]: name })
+				this.actions() // rebuild action definitions, e.g. screen dropdown labels
+			}
+		} else if (line.match(/SPise\d+,(0|1)$/)) {
+			//Whether a screen actually exists (has outputs and isn't a confidence screen).
+			//LiveCore supports up to 8 screens across up to 2 stacked devices, but not all of them
+			//necessarily exist, so variables are only declared for the screens that do.
+			this.log('info', 'Received ' + line)
+			try {
+				const [screen, enabled] = line.replace('SPise', '').split(',')
+				const wasEnabled = this.screenEnabled[Number(screen)]
+				this.screenEnabled[Number(screen)] = enabled === '1'
+				if (this.screenEnabled[Number(screen)]) {
+					this.screenKnownToExist[Number(screen)] = true
+				}
+				if (this.screenEnabled[Number(screen)] !== wasEnabled) {
+					this.updateVariableDefinitions()
+					this.actions() // rebuild action definitions, e.g. the per-screen dropdowns
+					if (this.screenEnabled[Number(screen)]) {
+						//Only query the rest of a screen's state once we know it actually exists
+						this.sendcmd(screen + ',SPscl')
+						this.sendcmd(screen + ',0,PIpid')
+						this.sendcmd(screen + ',1,PIpid')
+						this.sendcmd(screen + ',SPCtb')
+						this.sendcmd(screen + ',SCssh')
+						this.sendcmd(screen + ',SCssv')
+						this.sendcmd(screen + ',SCico')
+						for (let c = 0; c < 16; c += 1) {
+							this.sendcmd(screen + ',' + c + ',LBScr')
+						}
+					}
+				}
+			} catch (err) {
+				this.log('error', 'Failed to handle ' + line + ': ' + err.stack)
+			}
+		} else if (line.match(/PSval\d+,(0|1)$/)) {
+			//Whether a master preset memory slot actually has something saved to it.
+			const [memory, valid] = line.replace('PSval', '').split(',')
+			const wasValid = this.masterMemoryValid[Number(memory)]
+			this.masterMemoryValid[Number(memory)] = valid === '1'
+			if (this.masterMemoryValid[Number(memory)] !== wasValid) {
+				this.actions() // rebuild action definitions, e.g. the master memory dropdown
+				if (this.masterMemoryValid[Number(memory)]) {
+					//Only query the name of a master memory once we know it is actually saved
+					for (let c = 0; c < 16; c += 1) {
+						this.sendcmd(memory + ',' + c + ',LBPSe')
+					}
+				}
+			}
+		} else if (line.match(/LBPSe\d+,\d+,\d+$/)) {
+			//One character (as ASCII code) of a master preset memory's name, 16 chars max, NUL-terminated if shorter
+			const [memory, charIndex, code] = line.replace('LBPSe', '').split(',').map(Number)
+			this.masterMemoryNameChars[memory][charIndex] = code
+			let name = ''
+			for (const c of this.masterMemoryNameChars[memory]) {
+				if (c === undefined || c === 0) break
+				name += String.fromCharCode(c)
+			}
+			if (this.masterMemoryNames[memory] !== name) {
+				this.masterMemoryNames[memory] = name
+				this.actions() // rebuild action definitions, e.g. the master memory dropdown label
+			}
+		} else if (line.match(/LBPMe\d+,\d+,\d+$/)) {
+			//One character (as ASCII code) of a regular preset memory's name, 16 chars max, NUL-terminated if shorter
+			const [memory, charIndex, code] = line.replace('LBPMe', '').split(',').map(Number)
+			this.presetMemoryNameChars[memory][charIndex] = code
+			let name = ''
+			for (const c of this.presetMemoryNameChars[memory]) {
+				if (c === undefined || c === 0) break
+				name += String.fromCharCode(c)
+			}
+			if (this.presetMemoryNames[memory] !== name) {
+				this.presetMemoryNames[memory] = name
+				this.actions() // rebuild action definitions, e.g. the memory dropdown label
+			}
+		} else if (line.match(/CMlab\d+,\d+,\d+$/)) {
+			//One character (as ASCII code) of a confidence memory's name, 16 chars max, NUL-terminated if shorter
+			const [memory, charIndex, code] = line.replace('CMlab', '').split(',').map(Number)
+			this.confidenceMemoryNameChars[memory][charIndex] = code
+			let name = ''
+			for (const c of this.confidenceMemoryNameChars[memory]) {
+				if (c === undefined || c === 0) break
+				name += String.fromCharCode(c)
+			}
+			if (this.confidenceMemoryNames[memory] !== name) {
+				this.confidenceMemoryNames[memory] = name
+				this.actions() // rebuild action definitions, e.g. the confidence memory dropdown label
+			}
+		} else if (line.match(/LBMMo\d+,\d+,\d+$/)) {
+			//One character (as ASCII code) of a monitoring memory's name, 16 chars max, NUL-terminated if shorter
+			const [memory, charIndex, code] = line.replace('LBMMo', '').split(',').map(Number)
+			this.monitoringMemoryNameChars[memory][charIndex] = code
+			let name = ''
+			for (const c of this.monitoringMemoryNameChars[memory]) {
+				if (c === undefined || c === 0) break
+				name += String.fromCharCode(c)
+			}
+			if (this.monitoringMemoryNames[memory] !== name) {
+				this.monitoringMemoryNames[memory] = name
+				this.actions() // rebuild action definitions, e.g. the monitoring memory dropdown label
+			}
 		}
+	}
+
+	//(Re)declares the per-screen variables for only the screens that are currently enabled (SPise).
+	updateVariableDefinitions() {
+		let definitions = {
+			'device.firmware': { name: 'Device firmware version' },
+			'device.controllers': { name: 'Number of connected controllers' },
+			'device.fan_alarm': { name: 'Device fan alarm (1 = alarm raised)' },
+			'device.temperature_alarm': { name: 'Device temperature alarm status' },
+			'device.ready': { name: 'Device ready status' },
+		}
+		// screenKnownToExist (sticky, never reset once true) rather than the live screenEnabled:
+		// a screen switched to confidence mode reports as disabled (SPise = "has outputs and not
+		// confidence"), which would otherwise make its variables - including isconfidence itself -
+		// disappear right when they'd become interesting.
+		this.screenKnownToExist.forEach((known, s) => {
+			if (!known) return
+			definitions[`S${s + 1}.t-bar`] = { name: `Screen ${s + 1} T-Bar position` }
+			definitions[`S${s + 1}.name`] = { name: `Screen ${s + 1} name` }
+			definitions[`S${s + 1}.prv.memory`] = { name: `Screen ${s + 1} memory in preview` }
+			definitions[`S${s + 1}.pgm.memory`] = { name: `Screen ${s + 1} memory in program` }
+			definitions[`S${s + 1}.globaltake`] = { name: `Screen ${s + 1} selected for global take` }
+			definitions[`S${s + 1}.width`] = { name: `Screen ${s + 1} width in pixels (excludes AOI)` }
+			definitions[`S${s + 1}.height`] = { name: `Screen ${s + 1} height in pixels (excludes AOI)` }
+			definitions[`S${s + 1}.isconfidence`] = { name: `Screen ${s + 1} is a confidence screen` }
+		})
+		this.outputAvailable.forEach((available, o) => {
+			if (!available) return
+			definitions[`Out${o + 1}.name`] = { name: `Output ${o + 1} name` }
+			definitions[`Out${o + 1}.active`] = { name: `Output ${o + 1} is active` }
+			definitions[`Out${o + 1}.hdcp`] = { name: `Output ${o + 1} HDCP status` }
+		})
+		this.setVariableDefinitions(definitions)
+	}
+
+	//Dropdown choices for the screens that currently exist (SPise), labelled with their name if known.
+	//Pass oneBased:true for options whose stored values are 1-8 (e.g. destination screen fields),
+	//or leave false for options whose stored values are the 0-based screen index (e.g. SPscl/SPCtk).
+	getScreenChoices(oneBased = false) {
+		return this.screenEnabled
+			.map((enabled, s) => {
+				if (!enabled) return undefined
+				const label = `S${s + 1}` + (this.screenNames[s] ? ` - ${this.screenNames[s]}` : '')
+				return { id: String(oneBased ? s + 1 : s), label }
+			})
+			.filter((choice) => choice !== undefined)
+	}
+
+	//Dropdown choices for the inputs that currently exist (INava): 1-12 without a linked slave
+	//device, 1-24 with. Stored option values are always 1-based, matching the existing convention.
+	getInputChoices() {
+		return this.inputAvailable
+			.map((available, i) => {
+				if (!available) return undefined
+				const plug = PLUG_NAMES[this.inputActivePlug[i]]
+				const parts = [String(i + 1), plug, this.inputNames[i]].filter((part) => !!part)
+				return { id: String(i + 1), label: parts.join(' - ') }
+			})
+			.filter((choice) => choice !== undefined)
+	}
+
+	//Derives which memory is currently in program/preview per screen from the raw
+	//per-buffer memory identity (memoriesBuf0/1) and the take/t-bar status (programBuffer).
+	updatePresetMemories() {
+		let variableValues = {}
+		for (let screen = 0; screen < 8; screen += 1) {
+			if (this.programBuffer[screen] === 0) {
+				this.memoriesPGM[screen] = this.memoriesBuf0[screen]
+				this.memoriesPVW[screen] = this.memoriesBuf1[screen]
+			} else {
+				this.memoriesPGM[screen] = this.memoriesBuf1[screen]
+				this.memoriesPVW[screen] = this.memoriesBuf0[screen]
+			}
+			variableValues[`S${screen + 1}.pgm.memory`] = this.memoriesPGM[screen] === 255 ? '' : this.memoriesPGM[screen] + 1
+			variableValues[`S${screen + 1}.prv.memory`] = this.memoriesPVW[screen] === 255 ? '' : this.memoriesPVW[screen] + 1
+		}
+		this.setVariableValues(variableValues)
+		this.checkFeedbacks('memory_active')
 	}
 
 	init_tcp() {
@@ -248,7 +702,9 @@ class LiveCore extends InstanceBase {
 		}
 
 		if (self.config?.host) {
-			self.socket = new TCPHelper(self.config.host, parseInt(self.config.port))
+			// Hardcoded: the documented TPP port (10600) doesn't broadcast enough (e.g. no live
+			// t-bar position, see GCtba), so this module needs the richer internal port.
+			self.socket = new TCPHelper(self.config.host, 10500)
 
 			self.socket.on('status_change', function (status, message) {
 				self.updateStatus(status, message)
@@ -271,8 +727,8 @@ class LiveCore extends InstanceBase {
 					offset = 0
 				receivebuffer += chunk
 				while ((i = receivebuffer.indexOf('\r\n', offset)) !== -1) {
-					line = receivebuffer.substring(offset, i - offset)
-					offset = i + 1
+					line = receivebuffer.substring(offset, i)
+					offset = i + 2
 					self._receiveline(line.toString())
 				}
 				receivebuffer = receivebuffer.substring(offset)
@@ -296,29 +752,12 @@ class LiveCore extends InstanceBase {
 					'Enter the IP-adress of the Livecore unit you want to control. The IP of the unit can be found on the frontpanel LCD.\nIf you want to control stacked configurations, please enter the IP of the master unit.',
 			},
 			{
-				type: 'dropdown',
-				label: 'Variant',
-				id: 'variant',
-				default: '1',
-				choices: [
-					{ id: '1', label: 'ASC4806' },
-					{ id: '2', label: 'ASC3204' },
-					{ id: '3', label: 'ASC1602' },
-					{ id: '4', label: 'NXT1604' },
-					{ id: '5', label: 'NXT0802' },
-					{ id: '6', label: 'SMX12x4' },
-				],
-			},
-			{
-				type: 'dropdown',
-				label: 'Port number',
-				id: 'port',
-				default: '10600',
-				choices: [
-					{ id: '10600', label: '10600 (default)' },
-					{ id: '10500', label: '10500' },
-					{ id: '10400', label: '10500' },
-				],
+				type: 'static-text',
+				id: 'detected-device',
+				label: 'Detected device',
+				value: self.modelname
+					? self.modelname + (self.isSimulator ? ' (Simulator)' : '')
+					: 'Not yet detected - save the config with a valid IP-Adress and reopen this dialog once connected.',
 			},
 		]
 	}
@@ -356,16 +795,7 @@ class LiveCore extends InstanceBase {
 						label: 'Screen',
 						id: 'screen',
 						default: '0',
-						choices: [
-							{ id: '0', label: '1' },
-							{ id: '1', label: '2' },
-							{ id: '2', label: '3' },
-							{ id: '3', label: '4' },
-							{ id: '4', label: '5' },
-							{ id: '5', label: '6' },
-							{ id: '6', label: '7' },
-							{ id: '7', label: '8' },
-						],
+						choices: self.getScreenChoices(),
 					},
 				],
 				callback: (action) => {
@@ -378,20 +808,21 @@ class LiveCore extends InstanceBase {
 				name: 'Load Memory',
 				options: [
 					{
-						type: 'textinput',
+						type: 'dropdown',
 						label: 'Memory to load',
 						id: 'memory',
 						default: '1',
-						tooltip: 'Enter the number of the memory you want to load from 1 to 144',
-						regex: '/^0*([1-9]|[1-8][0-9]|9[0-9]|1[0-3][0-9]|14[0-4])$/',
+						choices: self.presetMemoryNames.map((name, m) => ({
+							id: String(m + 1),
+							label: `${m + 1}` + (name ? ` - ${name}` : ''),
+						})),
 					},
 					{
-						type: 'textinput',
+						type: 'dropdown',
 						label: 'Destination screen',
 						id: 'destscreen',
 						default: '1',
-						tooltip: 'Enter the number of the screen where the memory schould be loaded to (1 to 8)',
-						regex: '/^0*[1-8]$/',
+						choices: self.getScreenChoices(true),
 					},
 					{
 						type: 'dropdown',
@@ -448,12 +879,18 @@ class LiveCore extends InstanceBase {
 				name: 'Load Master Memory',
 				options: [
 					{
-						type: 'textinput',
+						type: 'dropdown',
 						label: 'Master Memory to load',
 						id: 'memory',
 						default: '1',
-						tooltip: 'Enter the number of the master memory you want to load from 1 to 144',
-						regex: '/^0*([1-9]|[1-8][0-9]|9[0-9]|1[0-3][0-9]|14[0-4])$/',
+						tooltip: 'Only master memories that actually have something saved to them are listed.',
+						choices: self.masterMemoryValid
+							.map((valid, m) =>
+								valid
+									? { id: String(m + 1), label: `${m + 1}` + (self.masterMemoryNames[m] ? ` - ${self.masterMemoryNames[m]}` : '') }
+									: undefined
+							)
+							.filter((choice) => choice !== undefined),
 					},
 					{
 						type: 'dropdown',
@@ -661,13 +1098,11 @@ class LiveCore extends InstanceBase {
 				name: 'Freeze Input',
 				options: [
 					{
-						type: 'textinput',
+						type: 'dropdown',
 						label: 'Input',
 						id: 'input',
 						default: '1',
-						tooltip:
-							'Enter the number of the input you want to adjust (1 to 12 for inputs of master device and 13 to 24 for inputs of slave device).',
-						regex: '/^0*([1-9]|1[0-9]|2[0-4])$/',
+						choices: self.getInputChoices(),
 					},
 					{
 						type: 'dropdown',
@@ -693,12 +1128,14 @@ class LiveCore extends InstanceBase {
 				name: 'Recall Monitoring Memory',
 				options: [
 					{
-						type: 'textinput',
+						type: 'dropdown',
 						label: 'Monitoring Memory to load',
 						id: 'memory',
 						default: '1',
-						tooltip: 'Enter the number of the memory you want to load from 1 to 8',
-						regex: '/^0*[1-8]$/',
+						choices: self.monitoringMemoryNames.map((name, m) => ({
+							id: String(m + 1),
+							label: `${m + 1}` + (name ? ` - ${name}` : ''),
+						})),
 					},
 					{
 						type: 'dropdown',
@@ -782,96 +1219,24 @@ class LiveCore extends InstanceBase {
 				name: 'Select screens for global take',
 				tooltip:
 					'Select the screens which schould transition with the global take command. The selection stays active until changed again.',
-				options: [
-					{
-						type: 'dropdown',
-						label: 'Screen 1',
-						id: '0',
-						default: '0',
-						choices: [
-							{ id: '0', label: 'No change' },
-							{ id: '1', label: 'Add to selection' },
-							{ id: '2', label: 'Remove from selection' },
-						],
-					},
-					{
-						type: 'dropdown',
-						label: 'Screen 2',
-						id: '1',
-						default: '0',
-						choices: [
-							{ id: '0', label: 'No change' },
-							{ id: '1', label: 'Add to selection' },
-							{ id: '2', label: 'Remove from selection' },
-						],
-					},
-					{
-						type: 'dropdown',
-						label: 'Screen 3',
-						id: '2',
-						default: '0',
-						choices: [
-							{ id: '0', label: 'No change' },
-							{ id: '1', label: 'Add to selection' },
-							{ id: '2', label: 'Remove from selection' },
-						],
-					},
-					{
-						type: 'dropdown',
-						label: 'Screen 4',
-						id: '3',
-						default: '0',
-						choices: [
-							{ id: '0', label: 'No change' },
-							{ id: '1', label: 'Add to selection' },
-							{ id: '2', label: 'Remove from selection' },
-						],
-					},
-					{
-						type: 'dropdown',
-						label: 'Screen 5',
-						id: '4',
-						default: '0',
-						choices: [
-							{ id: '0', label: 'No change' },
-							{ id: '1', label: 'Add to selection' },
-							{ id: '2', label: 'Remove from selection' },
-						],
-					},
-					{
-						type: 'dropdown',
-						label: 'Screen 6',
-						id: '5',
-						default: '0',
-						choices: [
-							{ id: '0', label: 'No change' },
-							{ id: '1', label: 'Add to selection' },
-							{ id: '2', label: 'Remove from selection' },
-						],
-					},
-					{
-						type: 'dropdown',
-						label: 'Screen 7',
-						id: '6',
-						default: '0',
-						choices: [
-							{ id: '0', label: 'No change' },
-							{ id: '1', label: 'Add to selection' },
-							{ id: '2', label: 'Remove from selection' },
-						],
-					},
-					{
-						type: 'dropdown',
-						label: 'Screen 8',
-						id: '7',
-						default: '0',
-						choices: [
-							{ id: '0', label: 'No change' },
-							{ id: '1', label: 'Add to selection' },
-							{ id: '2', label: 'Remove from selection' },
-						],
-					},
-				],
+				options: self.screenEnabled
+					.map((enabled, s) =>
+						enabled
+							? {
+									type: 'dropdown',
+									label: `Screen ${s + 1}` + (self.screenNames[s] ? ` - ${self.screenNames[s]}` : ''),
+									id: String(s),
+									default: '0',
+									choices: [
+										{ id: '0', label: 'No change' },
+										{ id: '1', label: 'Add to selection' },
+										{ id: '2', label: 'Remove from selection' },
+										{ id: '3', label: 'Toggle selection' },
+									],
+								}
+							: undefined
+					)
+					.filter((option) => option !== undefined),
 				callback: (action) => {
 					let cmd = ''
 					for (let option in action.options) {
@@ -879,6 +1244,8 @@ class LiveCore extends InstanceBase {
 							cmd += option + ',1SPscl\n'
 						} else if (action.options[option] == '2') {
 							cmd += option + ',0SPscl\n'
+						} else if (action.options[option] == '3') {
+							cmd += option + ',' + (self.activeScreen[Number(option)] ? '0' : '1') + 'SPscl\n'
 						}
 					}
 
@@ -890,24 +1257,62 @@ class LiveCore extends InstanceBase {
 					self.sendcmd(cmd)
 				},
 			},
+			selectscreen: {
+				name: 'Select single screen for global take',
+				tooltip:
+					'Add, remove or toggle a single screen in the selection which schould transition with the global take command. The selection stays active until changed again.',
+				options: [
+					{
+						type: 'dropdown',
+						label: 'Screen',
+						id: 'screen',
+						default: '0',
+						choices: self.getScreenChoices(),
+					},
+					{
+						type: 'dropdown',
+						label: 'Action',
+						id: 'action',
+						default: '1',
+						choices: [
+							{ id: '1', label: 'Add to selection' },
+							{ id: '2', label: 'Remove from selection' },
+							{ id: '3', label: 'Toggle selection' },
+						],
+					},
+				],
+				callback: (action) => {
+					const screen = action.options.screen
+					let value
+					if (action.options.action == '1') {
+						value = '1'
+					} else if (action.options.action == '2') {
+						value = '0'
+					} else {
+						value = self.activeScreen[Number(screen)] ? '0' : '1'
+					}
+					self.sendcmd(screen + ',' + value + 'SPscl')
+				},
+			},
 			loadconfidence: {
 				name: 'Load confidence Memory',
 				options: [
 					{
-						type: 'textinput',
+						type: 'dropdown',
 						label: 'Memory',
 						id: 'memory',
-						default: '',
-						tooltip: 'Enter the number of the memory you want to load from 1 to 16',
-						regex: '/^0*([1-9]|1[0-6])$/',
+						default: '1',
+						choices: self.confidenceMemoryNames.map((name, m) => ({
+							id: String(m + 1),
+							label: `${m + 1}` + (name ? ` - ${name}` : ''),
+						})),
 					},
 					{
-						type: 'textinput',
+						type: 'dropdown',
 						label: 'Destination screen',
 						id: 'destscreen',
 						default: '1',
-						tooltip: 'Enter the number of the screen where the memory schould be loaded to (1 to 8)',
-						regex: '/^0*[1-8]$/',
+						choices: self.getScreenChoices(true),
 					},
 				],
 				callback: (action) => {
@@ -920,12 +1325,16 @@ class LiveCore extends InstanceBase {
 				name: 'Switch confidence mode',
 				options: [
 					{
-						type: 'textinput',
+						type: 'dropdown',
 						label: 'Screen',
 						id: 'destscreen',
 						default: '1',
-						tooltip: 'Enter the number of the screen where confidence mode should be switched (1 to 8)',
-						regex: '/^0*[1-8]$/',
+						// Not self.getScreenChoices(): SPise (and thus screenEnabled) is defined as
+						// "has outputs and not confidence", so a screen currently in confidence mode
+						// would disappear from that list - making it impossible to switch back off.
+						// This action needs to be able to target a screen either way, so it always
+						// lists all 8 possible screens instead.
+						choices: Array.from({ length: 8 }, (_, s) => ({ id: String(s + 1), label: `S${s + 1}` })),
 					},
 					{
 						type: 'dropdown',
@@ -941,7 +1350,7 @@ class LiveCore extends InstanceBase {
 				],
 				callback: (action) => {
 					//         set memory to load                   set mode
-					let cmd = `${parseInt(action.options.screen) - 1},${action.options.mode}SCico`
+					let cmd = `${parseInt(action.options.destscreen) - 1},${action.options.mode}SCico`
 					self.sendcmd(cmd)
 				},
 			},
@@ -951,13 +1360,11 @@ class LiveCore extends InstanceBase {
 					'Note that not all inputs may be available at your system and not all plugs are available at any input.',
 				options: [
 					{
-						type: 'textinput',
+						type: 'dropdown',
 						label: 'Input',
 						id: 'input',
 						default: '1',
-						tooltip:
-							'Enter the number of the input where you want to switch the input plug (1 to 12 for inputs of master device and 13 to 24 for inputs of slave device).',
-						regex: '/^0*([1-9]|1[0-9]|2[0-4])$/',
+						choices: self.getInputChoices(),
 					},
 					{
 						type: 'dropdown',
@@ -966,7 +1373,7 @@ class LiveCore extends InstanceBase {
 						default: '0',
 						tooltip: 'Select the plug to use for that input',
 						choices: [
-							{ id: '0', label: 'Analog HD15 connector' },
+							{ id: '0', label: 'Analog VGA connector' },
 							{ id: '1', label: 'Analog DVI-A connector' },
 							{ id: '2', label: 'DVI' },
 							{ id: '3', label: 'SDI' },
@@ -974,6 +1381,21 @@ class LiveCore extends InstanceBase {
 							{ id: '5', label: 'DisplayPort' },
 						],
 					},
+					// One info text per input, always shown (filtering to just the selected input would
+					// require disableAutoExpression on the "input" field above, which would prevent it
+					// from being used as an expression - keeping "input" expression-capable wins here).
+					...self.getInputChoices().map((choice) => ({
+						type: 'static-text',
+						id: `plugs_info_${choice.id}`,
+						label: `Plugs on input ${choice.id}`,
+						value:
+							'Available Input Plugs: ' +
+							(self.inputPlugAvailable[Number(choice.id) - 1]
+								.map((available, p) => (available ? PLUG_NAMES[p] : undefined))
+								.filter((name) => name !== undefined)
+								.join(', ') || 'unknown'),
+						disableAutoExpression: true,
+					})),
 				],
 				callback: (action) => {
 					// set input
@@ -996,17 +1418,12 @@ class LiveCore extends InstanceBase {
 							"Enter any command you like in plain ASCII. Beware of correct syntax, you mustn't enter the linebreak at the end of the command. You can use variables here.",
 					},
 				],
-				callback: async (action, context) => {
-					try {
-						let cmd = await context.parseVariablesInString(action.options.command)
-						self.sendcmd(cmd)
-					} catch (err) {
-						self.log('error', 'Sending custom command failed ' + err)
-					}
+				callback: (action) => {
+					// With useVariables:true, Companion resolves variables in the value before
+					// the callback runs, so action.options.command already contains the final command.
+					self.sendcmd(action.options.command)
 				},
 			},
 		})
 	}
 }
-
-runEntrypoint(LiveCore, [])

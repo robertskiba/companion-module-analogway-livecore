@@ -1,4 +1,5 @@
 {
+	"type": "connection",
 	"id": "analogway-livecore",
 	"name": "analogway-livecore",
 	"shortname": "livecore",
@@ -18,7 +19,7 @@
 		"livecore"
 	],
 	"runtime": {
-		"type": "node18",
+		"type": "node22",
 		"api": "nodejs-ipc",
 		"apiVersion": "0.0.0",
 		"entrypoint": "../analogway_livecore.js"
