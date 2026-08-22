@@ -5,7 +5,7 @@ See HELP.md and LICENSE
 
 ## Version History
 
-### 3.0.0 (2026-08-22)
+### 3.0.0beta1 (2026-08-22)
 * major: require Companion v4.3+ (upgraded to @companion-module/base v2)
 * fix: PGM/PVW memory feedback finally works after all those years
 * fix: config save no longer crashes the connection
